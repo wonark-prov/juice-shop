@@ -39,10 +39,6 @@ jobs:
     env:
       GREPRULES_VERSION: v0.5.1
       GREPRULES_OPENGREP_INCLUDE_DEFAULT_RULES: "false"
-      GREPRULES_STATE_HOME: ${{ runner.temp }}/greprules-fresh/state
-      GREPRULES_CACHE_HOME: ${{ runner.temp }}/greprules-fresh/cache
-      GREPRULES_CACHE_DIR: ${{ runner.temp }}/greprules-fresh/cache/dir
-      GREPRULES_INSTALL_DIR: ${{ runner.temp }}/greprules-bin
       GREPRULES_INSTALLER_URL: https://raw.githubusercontent.com/greprules/greprules/69e8a0a735a9ee318ba96e506b86fd21747db0ab/install.sh
     steps:
       - name: Checkout the commit to scan
@@ -54,6 +50,10 @@ jobs:
 
       - name: Scan with a fresh Registry state
         env:
+          GREPRULES_STATE_HOME: ${{ runner.temp }}/greprules-fresh/state
+          GREPRULES_CACHE_HOME: ${{ runner.temp }}/greprules-fresh/cache
+          GREPRULES_CACHE_DIR: ${{ runner.temp }}/greprules-fresh/cache/dir
+          GREPRULES_INSTALL_DIR: ${{ runner.temp }}/greprules-bin
           SCAN_EVENT: ${{ github.event_name }}
           SCAN_REPOSITORY: ${{ github.repository }}
           SCAN_REPOSITORY_ID: ${{ github.repository_id }}
