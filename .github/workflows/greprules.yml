@@ -1,0 +1,312 @@
+name: Greprules
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_type:
+        description: branch or tag. Must match the ref selected to run this workflow.
+        required: true
+        type: choice
+        options:
+          - branch
+          - tag
+      source_name:
+        description: Branch or tag name. Must match the ref selected to run this workflow.
+        required: true
+        type: string
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+concurrency:
+  group: greprules-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GREPRULES_VERSION: v0.5.1
+      GREPRULES_OPENGREP_INCLUDE_DEFAULT_RULES: "false"
+      GREPRULES_INSTALLER_URL: https://raw.githubusercontent.com/greprules/greprules/69e8a0a735a9ee318ba96e506b86fd21747db0ab/install.sh
+    steps:
+      - name: Checkout the commit to scan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.ref }}
+
+      - name: Scan with a fresh Registry state
+        env:
+          GREPRULES_STATE_HOME: ${{ runner.temp }}/greprules-fresh/state
+          GREPRULES_CACHE_HOME: ${{ runner.temp }}/greprules-fresh/cache
+          GREPRULES_CACHE_DIR: ${{ runner.temp }}/greprules-fresh/pack-cache
+          GREPRULES_INSTALL_DIR: ${{ runner.temp }}/greprules-bin
+          SCAN_EVENT: ${{ github.event_name }}
+          SCAN_REPOSITORY: ${{ github.repository }}
+          SCAN_REPOSITORY_ID: ${{ github.repository_id }}
+          SCAN_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          SCAN_HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id || github.repository_id }}
+          SCAN_RUN_ID: ${{ github.run_id }}
+          SCAN_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SCAN_RUN_NUMBER: ${{ github.run_number }}
+          SCAN_REF: ${{ github.ref }}
+          SCAN_REF_TYPE: ${{ github.ref_type }}
+          SCAN_REF_NAME: ${{ github.ref_name }}
+          SCAN_GITHUB_SHA: ${{ github.sha }}
+          SCAN_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          SCAN_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          SCAN_PR_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          SCAN_PR_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          SCAN_SOURCE_TYPE: ${{ github.event.inputs.source_type || '' }}
+          SCAN_SOURCE_NAME: ${{ github.event.inputs.source_name || '' }}
+          SCAN_STAGING: ${{ runner.temp }}/greprules-artifact
+          SCAN_STATUS_FILE: ${{ runner.temp }}/greprules-scan-status.txt
+        run: |
+          set -u -o pipefail
+          staging="$SCAN_STAGING"
+          rm -rf "$staging" "$RUNNER_TEMP/greprules-fresh" "$GREPRULES_INSTALL_DIR"
+          mkdir -p "$staging/provenance/manifests" "$GREPRULES_STATE_HOME" "$GREPRULES_CACHE_HOME" "$GREPRULES_CACHE_DIR" "$GREPRULES_INSTALL_DIR"
+          if [ -n "$(find "$GREPRULES_STATE_HOME" "$GREPRULES_CACHE_HOME" "$GREPRULES_CACHE_DIR" -mindepth 1 -print -quit)" ]; then
+            echo "Greprules state or cache was not empty before the scan" >&2
+            exit 1
+          fi
+          export SCAN_STATUS=operational_failure
+          export SCAN_EXIT=1
+          export SCAN_RESOLVED=""
+          export SCAN_STARTED
+          SCAN_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          wrote=0
+          finish() {
+            if [ "$wrote" -eq 1 ]; then
+              return 0
+            fi
+            export SCAN_FINISHED
+            SCAN_FINISHED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            python3 -c 'import textwrap,sys; exec(textwrap.dedent(sys.stdin.read()))' <<'PY' || true
+          import hashlib, json, os, re, shutil
+
+          staging = os.environ["SCAN_STAGING"]
+          status = os.environ.get("SCAN_STATUS", "operational_failure")
+          exit_code = int(os.environ.get("SCAN_EXIT", "1") or "1")
+          event = os.environ["SCAN_EVENT"]
+          ref_type = os.environ["SCAN_REF_TYPE"]
+          ref_name = os.environ["SCAN_REF_NAME"]
+          repo_id = int(os.environ["SCAN_REPOSITORY_ID"])
+          head_id = int(os.environ["SCAN_HEAD_REPOSITORY_ID"])
+          fork = head_id != repo_id
+
+          def explicit_packs(root):
+              chosen = None
+              for name in ("config.yaml", "config.yml"):
+                  candidate = os.path.join(root, ".greprules", name)
+                  if os.path.isfile(candidate):
+                      chosen = candidate
+                      break
+              if chosen is None:
+                  return "recommended"
+              try:
+                  lines = open(chosen, encoding="utf-8", errors="replace").read().splitlines()
+              except OSError:
+                  return None
+              for index, line in enumerate(lines):
+                  if line.startswith((" ", "\t", "#")) or not line.startswith("packs:"):
+                      continue
+                  rest = line[len("packs:"):].strip()
+                  if rest in ("[]", "null", "~"):
+                      return "recommended"
+                  if rest == "":
+                      for nxt in lines[index + 1:]:
+                          if nxt.strip() == "" or nxt.lstrip().startswith("#"):
+                              continue
+                          if nxt.startswith((" ", "\t")):
+                              return "repository_config" if nxt.strip().startswith("- ") else "repository_config"
+                          break
+                      return "recommended"
+                  return "repository_config"
+              return "recommended"
+
+          packs_source = explicit_packs(os.getcwd())
+          if packs_source is None:
+              status = "operational_failure"
+              exit_code = 1
+              packs_source = "repository_config"
+
+          def under_roots(path):
+              real = os.path.realpath(path)
+              roots = [os.environ["GREPRULES_STATE_HOME"], os.environ["GREPRULES_CACHE_HOME"], os.environ["GREPRULES_CACHE_DIR"]]
+              return any(real == os.path.realpath(root) or real.startswith(os.path.realpath(root) + os.sep) for root in roots if os.path.isdir(root))
+
+          locks = []
+          projects = os.path.join(os.environ["GREPRULES_STATE_HOME"], "greprules", "projects")
+          if os.path.isdir(projects):
+              for dirpath, _, filenames in os.walk(projects):
+                  if "lock.json" in filenames:
+                      locks.append(os.path.join(dirpath, "lock.json"))
+          manifests = {}
+          if len(locks) == 1:
+              lock_dest = os.path.join(staging, "provenance", "lock.json")
+              shutil.copyfile(locks[0], lock_dest)
+              try:
+                  lock = json.load(open(lock_dest, encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  lock = {}
+                  status = "operational_failure"
+                  exit_code = 1
+              for pack in lock.get("packs", []):
+                  pack_id = pack.get("id") if isinstance(pack, dict) else None
+                  src = pack.get("manifestPath") if isinstance(pack, dict) else None
+                  if not isinstance(pack_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}", pack_id):
+                      status = "operational_failure"
+                      exit_code = 1
+                      continue
+                  if not isinstance(src, str) or not os.path.isfile(src) or not under_roots(src):
+                      status = "operational_failure"
+                      exit_code = 1
+                      continue
+                  dest = os.path.join(staging, "provenance", "manifests", f"{pack_id}.manifest.json")
+                  shutil.copyfile(src, dest)
+                  manifests[pack_id] = hashlib.sha256(open(dest, "rb").read()).hexdigest()
+              lock_bytes = open(lock_dest, "rb").read()
+              hash_path = os.path.join(staging, "provenance", "manifest-hashes.json")
+              with open(hash_path, "w", encoding="utf-8") as handle:
+                  json.dump({"lock_sha256": hashlib.sha256(lock_bytes).hexdigest(), "manifests": manifests}, handle)
+          elif status == "completed":
+              status = "operational_failure"
+              exit_code = 1
+
+          version_path = os.path.join(staging, "greprules-version.txt")
+          version_text = open(version_path, encoding="utf-8").read() if os.path.isfile(version_path) else ""
+          version_match = re.search(r"(?:^|[^\d])(\d+\.\d+\.\d+)(?:[^\d]|$)", version_text)
+          cli_version = version_match.group(1) if version_match else ""
+          if status == "completed" and cli_version != "0.5.1":
+              status = "operational_failure"
+              exit_code = 1
+
+          if event == "pull_request":
+              role, updates = "pull_request", False
+          elif event == "workflow_dispatch":
+              role, updates = ("dispatch_tag" if ref_type == "tag" else "dispatch_branch"), False
+          elif event == "push" and not fork and ref_type == "branch" and ref_name in ("master", "main"):
+              role, updates = "managed_branch", True
+          else:
+              role, updates = "unmanaged", False
+
+          pull = None
+          if event == "pull_request":
+              pull = {
+                  "number": int(os.environ["SCAN_PR_NUMBER"]),
+                  "head_sha": os.environ["SCAN_PR_HEAD_SHA"],
+                  "base_ref": os.environ["SCAN_PR_BASE_REF"],
+                  "head_ref": os.environ["SCAN_PR_HEAD_REF"],
+                  "head_repository": {
+                      "id": head_id,
+                      "full_name": os.environ["SCAN_HEAD_REPOSITORY"],
+                  },
+              }
+          envelope = {
+              "schema": "greprules.scan-envelope.v1",
+              "repository": {"id": repo_id, "full_name": os.environ["SCAN_REPOSITORY"]},
+              "head_repository": {"id": head_id, "full_name": os.environ["SCAN_HEAD_REPOSITORY"]},
+              "workflow": {
+                  "name": "Greprules",
+                  "file": ".github/workflows/greprules.yml",
+                  "run_id": int(os.environ["SCAN_RUN_ID"]),
+                  "run_attempt": int(os.environ["SCAN_RUN_ATTEMPT"]),
+                  "run_number": int(os.environ["SCAN_RUN_NUMBER"]),
+                  "event": event,
+                  "ref": os.environ["SCAN_REF"],
+                  "ref_type": ref_type,
+                  "github_sha": os.environ["SCAN_GITHUB_SHA"],
+              },
+              "resolved_commit_sha": os.environ.get("SCAN_RESOLVED", ""),
+              "pull_request": pull,
+              "scan": {
+                  "started_at": os.environ["SCAN_STARTED"],
+                  "finished_at": os.environ["SCAN_FINISHED"],
+                  "status": status,
+                  "exit_code": exit_code,
+                  "cli_version": cli_version or "unknown",
+                  "command": "greprules scan . --sarif --output greprules.sarif --verbose",
+                  "packs_source": packs_source,
+                  "fresh_state": True,
+                  "include_default_rules": False,
+              },
+              "classification": {
+                  "inventory_role": role,
+                  "updates_managed_inventory": updates,
+              },
+          }
+          with open(os.path.join(staging, "envelope.json"), "w", encoding="utf-8") as handle:
+              json.dump(envelope, handle)
+          with open(os.environ["SCAN_STATUS_FILE"], "w", encoding="utf-8") as handle:
+              handle.write(status)
+          PY
+            wrote=1
+            if [ -f "$SCAN_STATUS_FILE" ]; then
+              SCAN_STATUS="$(cat "$SCAN_STATUS_FILE")"
+            fi
+          }
+          trap finish EXIT
+
+          resolved="$(git rev-parse HEAD)"
+          export SCAN_RESOLVED="$resolved"
+          if [ "$SCAN_EVENT" = "workflow_dispatch" ] && { [ "$SCAN_SOURCE_TYPE" != "$SCAN_REF_TYPE" ] || [ "$SCAN_SOURCE_NAME" != "$SCAN_REF_NAME" ]; }; then
+            echo "workflow_dispatch inputs must match the ref used to run this workflow" >&2
+            exit 1
+          fi
+          if [ "$SCAN_EVENT" = "pull_request" ] && [ "$resolved" != "$SCAN_PR_HEAD_SHA" ]; then
+            echo "checkout does not match the pull request head" >&2
+            exit 1
+          fi
+          if [ "$SCAN_EVENT" != "pull_request" ] && [ "$resolved" != "$SCAN_GITHUB_SHA" ]; then
+            echo "checkout does not match GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          export PATH="$GREPRULES_INSTALL_DIR:$PATH"
+          if ! curl -fsSL "$GREPRULES_INSTALLER_URL" | sh; then
+            echo "greprules install failed" >&2
+            exit 1
+          fi
+          if ! greprules version | tee "$staging/greprules-version.txt"; then
+            echo "greprules version failed" >&2
+            exit 1
+          fi
+          set +e
+          greprules scan . --sarif --output "$staging/greprules.sarif" --verbose
+          scan_exit=$?
+          set -e
+          export SCAN_EXIT="$scan_exit"
+          if [ "$scan_exit" -eq 0 ]; then
+            export SCAN_STATUS=completed
+          fi
+          finish
+          trap - EXIT
+          if [ "$SCAN_STATUS" != "completed" ]; then
+            exit 1
+          fi
+
+      - name: Upload scan artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: greprules-scan-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/greprules-artifact
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: false
+          archive: true
+          include-hidden-files: true
