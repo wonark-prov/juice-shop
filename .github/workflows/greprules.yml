@@ -14,6 +14,13 @@ on:
       correlation: {required: true, type: string}
       installation_id: {required: true, type: string}
       policy_sha256: {required: true, type: string}
+      context: {required: true, type: string}
+      pull_id: {required: false, type: string, default: ''}
+      pull_number: {required: false, type: string, default: ''}
+      base_sha: {required: false, type: string, default: ''}
+      base_ref: {required: false, type: string, default: ''}
+      head_ref: {required: false, type: string, default: ''}
+      head_repository_name: {required: false, type: string, default: ''}
 permissions:
   contents: read
 concurrency:
@@ -36,6 +43,13 @@ jobs:
       INPUT_CORRELATION: ${{ inputs.correlation }}
       INPUT_INSTALLATION: ${{ inputs.installation_id }}
       INPUT_POLICY: ${{ inputs.policy_sha256 }}
+      INPUT_CONTEXT: ${{ inputs.context }}
+      INPUT_PULL_ID: ${{ inputs.pull_id }}
+      INPUT_PULL_NUMBER: ${{ inputs.pull_number }}
+      INPUT_BASE_SHA: ${{ inputs.base_sha }}
+      INPUT_BASE_REF: ${{ inputs.base_ref }}
+      INPUT_HEAD_REF: ${{ inputs.head_ref }}
+      INPUT_HEAD_REPOSITORY_NAME: ${{ inputs.head_repository_name }}
       EXECUTION_SHA: ${{ github.sha }}
       EXECUTION_REF: ${{ github.ref_name }}
       EXECUTION_REPOSITORY: ${{ github.repository }}
@@ -59,12 +73,20 @@ jobs:
               assert re.fullmatch(r'[1-9][0-9]{0,15}', os.environ[key])
           for key in ('INPUT_SHA', 'INPUT_TREE'):
               assert re.fullmatch(r'[a-f0-9]{40}', os.environ[key])
-          assert os.environ['INPUT_REPOSITORY'] == os.environ['EXECUTION_REPOSITORY_ID']
+          assert os.environ['INPUT_CONTEXT'] in ('initial', 'pull_request')
+          if os.environ['INPUT_CONTEXT'] == 'initial':
+              assert os.environ['INPUT_REPOSITORY'] == os.environ['EXECUTION_REPOSITORY_ID']
+              assert all(not os.environ[k] for k in ('INPUT_PULL_ID','INPUT_PULL_NUMBER','INPUT_BASE_SHA','INPUT_BASE_REF','INPUT_HEAD_REF','INPUT_HEAD_REPOSITORY_NAME'))
+          else:
+              assert all(re.fullmatch(r'[1-9][0-9]{0,15}', os.environ[k]) for k in ('INPUT_PULL_ID','INPUT_PULL_NUMBER'))
+              assert re.fullmatch(r'[a-f0-9]{40}', os.environ['INPUT_BASE_SHA'])
+              assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}', os.environ['INPUT_HEAD_REPOSITORY_NAME'])
+              assert os.environ['INPUT_KIND'] == 'branch' and os.environ['INPUT_NAME'] == os.environ['INPUT_HEAD_REF']
           assert os.environ['INPUT_KIND'] in ('branch', 'tag')
-          name = os.environ['INPUT_NAME']
-          assert name and len(name.encode()) <= 255 and name != '@'
-          assert not re.search(r'[\x00-\x20\x7f~^:?*\[\\]', name) and '..' not in name and '@{' not in name and not name.endswith('.')
-          assert all(p and not p.startswith('.') and not p.endswith('.lock') for p in name.split('/'))
+          for name in [os.environ['INPUT_NAME']] + ([os.environ['INPUT_BASE_REF']] if os.environ['INPUT_CONTEXT'] == 'pull_request' else []):
+              assert name and len(name.encode()) <= 255 and name != '@'
+              assert not re.search(r'[\x00-\x20\x7f~^:?*\[\\]', name) and '..' not in name and '@{' not in name and not name.endswith('.')
+              assert all(p and not p.startswith('.') and not p.endswith('.lock') for p in name.split('/'))
           expires = datetime.datetime.fromisoformat(os.environ['INPUT_EXPIRES'].replace('Z', '+00:00'))
           assert expires > datetime.datetime.now(datetime.timezone.utc)
           policy = (json.dumps({'schemaVersion':'greprules.local.v1','packs':[],'registry':'https://api.greprules.io'}, separators=(',',':'))+'\n').encode()
@@ -78,7 +100,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ inputs.context == 'pull_request' && format('refs/pull/{0}/head', inputs.pull_number) || inputs.source_sha }}
           path: scan-root/source
           lfs: false
           submodules: false
@@ -86,8 +108,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          stage="$RUNNER_TEMP/greprules-app-v2-artifact"
-          isolated="$RUNNER_TEMP/greprules-app-v2-isolated"
+          stage="$RUNNER_TEMP/greprules-app-v3-artifact"
+          isolated="$RUNNER_TEMP/greprules-app-v3-isolated"
           mkdir "$stage" "$isolated"
           mkdir -p "$stage/provenance/manifests" "$isolated/home" "$isolated/state" "$isolated/cache" "$isolated/pack-cache" "$isolated/bin"
           export STAGING="$stage" HOME="$isolated/home"
@@ -154,21 +176,25 @@ jobs:
               shutil.copyfile(pack['manifestPath'],target)
               manifests[pack['id']] = hashlib.sha256(open(target,'rb').read()).hexdigest()
           json.dump({'lock_sha256':hashlib.sha256(open(lockpath,'rb').read()).hexdigest(),'manifests':manifests},open(os.path.join(stage,'provenance','manifest-hashes.json'),'w'))
-          envelope = {'schema':'greprules.scan-envelope.v2','templateVersion':'app-dispatch-v2',
+          envelope = {'schema':'greprules.scan-envelope.v3','templateVersion':'app-dispatch-v3',
             'repository':{'id':int(os.environ['EXECUTION_REPOSITORY_ID']),'fullName':os.environ['EXECUTION_REPOSITORY']},
             'installationId':int(os.environ['INPUT_INSTALLATION']),'intentId':os.environ['INPUT_INTENT'],'configurationRevision':int(os.environ['INPUT_REVISION']),
-            'correlation':os.environ['INPUT_CORRELATION'],'context':'initial',
+            'correlation':os.environ['INPUT_CORRELATION'],'context':os.environ['INPUT_CONTEXT'],
             'source':{'kind':os.environ['INPUT_KIND'],'name':os.environ['INPUT_NAME'],'commitSha':os.environ['INPUT_SHA'],'treeSha':os.environ['INPUT_TREE'],'headRepositoryGithubId':int(os.environ['INPUT_REPOSITORY']),'prefix':'source/'},
             'workflow':{'name':'Greprules App','path':'.github/workflows/greprules.yml','runId':int(os.environ['EXECUTION_RUN_ID']),'attempt':int(os.environ['EXECUTION_ATTEMPT']),'event':'workflow_dispatch','executionSha':os.environ['EXECUTION_SHA'],'branch':os.environ['EXECUTION_REF'],'actorId':int(os.environ['EXECUTION_ACTOR_ID'])},
             'scan':{'command':'greprules scan source --root . --sarif --output greprules.sarif --verbose','status':'completed','exitCode':0,'cliVersion':'0.5.1','freshState':True,'includeDefaultRules':False,'policySha256':os.environ['INPUT_POLICY'],'startedAt':os.environ['SCAN_STARTED']}}
+          if os.environ['INPUT_CONTEXT'] == 'pull_request':
+              envelope['pull'] = {'id':int(os.environ['INPUT_PULL_ID']),'number':int(os.environ['INPUT_PULL_NUMBER']),
+                'base':{'repositoryId':int(os.environ['EXECUTION_REPOSITORY_ID']),'fullName':os.environ['EXECUTION_REPOSITORY'],'ref':os.environ['INPUT_BASE_REF'],'sha':os.environ['INPUT_BASE_SHA']},
+                'head':{'repositoryId':int(os.environ['INPUT_REPOSITORY']),'fullName':os.environ['INPUT_HEAD_REPOSITORY_NAME'],'ref':os.environ['INPUT_HEAD_REF'],'sha':os.environ['INPUT_SHA']}}
           json.dump(envelope,open(os.path.join(stage,'envelope.json'),'w'))
           PY
       - name: Upload immutable scan evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: greprules-app-v2-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/greprules-app-v2-artifact
+          name: greprules-app-v3-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/greprules-app-v3-artifact
           retention-days: 30
           if-no-files-found: error
           overwrite: false
