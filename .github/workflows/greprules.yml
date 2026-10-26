@@ -52,7 +52,7 @@ jobs:
         env:
           GREPRULES_STATE_HOME: ${{ runner.temp }}/greprules-fresh/state
           GREPRULES_CACHE_HOME: ${{ runner.temp }}/greprules-fresh/cache
-          GREPRULES_CACHE_DIR: ${{ runner.temp }}/greprules-fresh/cache/dir
+          GREPRULES_CACHE_DIR: ${{ runner.temp }}/greprules-fresh/pack-cache
           GREPRULES_INSTALL_DIR: ${{ runner.temp }}/greprules-bin
           SCAN_EVENT: ${{ github.event_name }}
           SCAN_REPOSITORY: ${{ github.repository }}
