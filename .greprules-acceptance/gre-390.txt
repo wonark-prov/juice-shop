@@ -1,0 +1,2 @@
+GRE-390 PR automation acceptance.
+Revision 2: verifies synchronize dispatch and updates to one App comment.
