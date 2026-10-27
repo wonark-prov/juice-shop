@@ -21,6 +21,12 @@ on:
       base_ref: {required: false, type: string, default: ''}
       head_ref: {required: false, type: string, default: ''}
       head_repository_name: {required: false, type: string, default: ''}
+      managed_branch: {required: false, type: string, default: ''}
+      managed_generation: {required: false, type: string, default: ''}
+      managed_intent_order: {required: false, type: string, default: ''}
+      scope_policy_digest: {required: true, type: string}
+      rule_policy_mode: {required: true, type: string}
+      rule_policy_json: {required: true, type: string}
 permissions:
   contents: read
 concurrency:
@@ -50,6 +56,12 @@ jobs:
       INPUT_BASE_REF: ${{ inputs.base_ref }}
       INPUT_HEAD_REF: ${{ inputs.head_ref }}
       INPUT_HEAD_REPOSITORY_NAME: ${{ inputs.head_repository_name }}
+      INPUT_MANAGED_BRANCH: ${{ inputs.managed_branch }}
+      INPUT_MANAGED_GENERATION: ${{ inputs.managed_generation }}
+      INPUT_MANAGED_ORDER: ${{ inputs.managed_intent_order }}
+      INPUT_SCOPE_POLICY: ${{ inputs.scope_policy_digest }}
+      INPUT_RULE_MODE: ${{ inputs.rule_policy_mode }}
+      INPUT_RULE_JSON: ${{ inputs.rule_policy_json }}
       EXECUTION_SHA: ${{ github.sha }}
       EXECUTION_REF: ${{ github.ref_name }}
       EXECUTION_REPOSITORY: ${{ github.repository }}
@@ -73,11 +85,28 @@ jobs:
               assert re.fullmatch(r'[1-9][0-9]{0,15}', os.environ[key])
           for key in ('INPUT_SHA', 'INPUT_TREE'):
               assert re.fullmatch(r'[a-f0-9]{40}', os.environ[key])
-          assert os.environ['INPUT_CONTEXT'] in ('initial', 'pull_request')
+          assert os.environ['INPUT_CONTEXT'] in ('initial', 'pull_request', 'managed')
+          assert os.environ['INPUT_RULE_MODE'] in ('recommended', 'explicit')
+          packs = json.loads(os.environ['INPUT_RULE_JSON'])
+          assert isinstance(packs, list) and len(os.environ['INPUT_RULE_JSON']) <= 4096
+          if os.environ['INPUT_RULE_MODE'] == 'recommended':
+              assert packs == []
+          else:
+              assert 1 <= len(packs) <= 32 and packs == sorted(set(packs))
+              assert all(isinstance(item, str) and __import__('re').fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,80}', item) for item in packs)
+          managed_keys = ('INPUT_MANAGED_BRANCH','INPUT_MANAGED_GENERATION','INPUT_MANAGED_ORDER')
+          if os.environ['INPUT_CONTEXT'] == 'managed':
+              assert os.environ['INPUT_KIND'] == 'branch' and os.environ['INPUT_NAME'] == os.environ['INPUT_MANAGED_BRANCH']
+              assert os.environ['INPUT_REPOSITORY'] == os.environ['EXECUTION_REPOSITORY_ID']
+              assert all(not os.environ[k] for k in ('INPUT_PULL_ID','INPUT_PULL_NUMBER','INPUT_BASE_SHA','INPUT_BASE_REF','INPUT_HEAD_REF','INPUT_HEAD_REPOSITORY_NAME'))
+              for key in ('INPUT_MANAGED_GENERATION','INPUT_MANAGED_ORDER'):
+                  assert re.fullmatch(r'[1-9][0-9]{0,15}', os.environ[key]) and int(os.environ[key]) <= 9007199254740991
+          else:
+              assert all(not os.environ[k] for k in managed_keys)
           if os.environ['INPUT_CONTEXT'] == 'initial':
               assert os.environ['INPUT_REPOSITORY'] == os.environ['EXECUTION_REPOSITORY_ID']
               assert all(not os.environ[k] for k in ('INPUT_PULL_ID','INPUT_PULL_NUMBER','INPUT_BASE_SHA','INPUT_BASE_REF','INPUT_HEAD_REF','INPUT_HEAD_REPOSITORY_NAME'))
-          else:
+          elif os.environ['INPUT_CONTEXT'] == 'pull_request':
               assert all(re.fullmatch(r'[1-9][0-9]{0,15}', os.environ[k]) for k in ('INPUT_PULL_ID','INPUT_PULL_NUMBER'))
               assert re.fullmatch(r'[a-f0-9]{40}', os.environ['INPUT_BASE_SHA'])
               assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}', os.environ['INPUT_HEAD_REPOSITORY_NAME'])
@@ -89,8 +118,9 @@ jobs:
               assert all(p and not p.startswith('.') and not p.endswith('.lock') for p in name.split('/'))
           expires = datetime.datetime.fromisoformat(os.environ['INPUT_EXPIRES'].replace('Z', '+00:00'))
           assert expires > datetime.datetime.now(datetime.timezone.utc)
-          policy = (json.dumps({'schemaVersion':'greprules.local.v1','packs':[],'registry':'https://api.greprules.io'}, separators=(',',':'))+'\n').encode()
+          policy = (json.dumps({'schemaVersion':'greprules.local.v1','packs':packs,'registry':'https://api.greprules.io'}, separators=(',',':'))+'\n').encode()
           assert hashlib.sha256(policy).hexdigest() == os.environ['INPUT_POLICY']
+          assert re.fullmatch(r'[a-f0-9]{64}', os.environ['INPUT_SCOPE_POLICY'])
           root = os.path.join(os.environ['GITHUB_WORKSPACE'], 'scan-root')
           os.makedirs(os.path.join(root, '.greprules'), exist_ok=True)
           open(os.path.join(root, '.greprules', 'config.local.json'), 'wb').write(policy)
@@ -108,19 +138,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          stage="$RUNNER_TEMP/greprules-app-v3-artifact"
-          isolated="$RUNNER_TEMP/greprules-app-v3-isolated"
+          stage="$RUNNER_TEMP/greprules-app-v4-artifact"
+          isolated="$RUNNER_TEMP/greprules-app-v4-isolated"
           mkdir "$stage" "$isolated"
           mkdir -p "$stage/provenance/manifests" "$isolated/home" "$isolated/state" "$isolated/cache" "$isolated/pack-cache" "$isolated/bin"
           export STAGING="$stage" HOME="$isolated/home"
+          export XDG_CONFIG_HOME="$isolated/xdg-config" XDG_CACHE_HOME="$isolated/xdg-cache" XDG_STATE_HOME="$isolated/xdg-state"
+          mkdir "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
           export GREPRULES_STATE_HOME="$isolated/state" GREPRULES_CACHE_HOME="$isolated/cache" GREPRULES_CACHE_DIR="$isolated/pack-cache"
           export GREPRULES_INSTALL_DIR="$isolated/bin" PATH="$isolated/bin:$PATH"
           export SCAN_ROOT="$GITHUB_WORKSPACE/scan-root"
           export SCAN_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
           cat > "$isolated/hash-source.py" <<'PY'
           import os, subprocess, json, hashlib, stat
           root = os.path.join(os.environ['SCAN_ROOT'], 'source')
-          def git(*args): return subprocess.check_output(['git', '-c', 'core.hooksPath=/dev/null', '-C', root, *args])
+          def git(*args): return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','core.excludesFile=/dev/null','-c','core.attributesFile=/dev/null','-C', root, *args])
           assert git('rev-parse', 'HEAD').decode().strip() == os.environ['INPUT_SHA']
           assert git('rev-parse', 'HEAD^{tree}').decode().strip() == os.environ['INPUT_TREE']
           files = []
@@ -129,7 +162,7 @@ jobs:
               info, rawpath = row.split(b'\t', 1)
               mode, oid, stage = info.decode().split(' ')
               path = rawpath.decode('utf-8', 'strict')
-              assert mode in ('100644','100755') and stage == '0'
+              assert mode in ('100644','100755') and stage == '0'  # reject symlink 120000 and submodule 160000
               assert len(path.encode()) <= 1024 and '\\' not in path and not any(ord(c)<32 or ord(c)==127 for c in path)
               assert all(p not in ('', '.', '..') for p in path.split('/'))
               fullpath = os.path.join(root, path)
@@ -143,7 +176,7 @@ jobs:
                       if not data: break
                       actual.update(data); digest.update(data)
               assert actual.hexdigest() == oid
-              files.append({'path':path,'blobSha':oid,'size':st.st_size,'sha256':digest.hexdigest()})
+              files.append({'path':path,'blobSha':oid,'size':st.st_size,'sha256':digest.hexdigest(),'mode':mode})
           assert len(files) <= 10000
           value = {'schema':'greprules.source-hashes.v1','commitSha':os.environ['INPUT_SHA'],'treeSha':os.environ['INPUT_TREE'],'prefix':'source/','files':sorted(files,key=lambda x:x['path'])}
           data = json.dumps(value, separators=(',',':'), ensure_ascii=False).encode()
@@ -158,7 +191,7 @@ jobs:
           python3 "$isolated/hash-source.py" > "$isolated/source-after.json"
           cmp "$stage/provenance/source-hashes.json" "$isolated/source-after.json"
           python3 - <<'PY'
-          import os, json, hashlib, shutil, re
+          import os, json, hashlib, shutil, re, stat
           stage = os.environ['STAGING']
           roots = [os.path.realpath(os.environ[k]) for k in ('GREPRULES_STATE_HOME','GREPRULES_CACHE_HOME','GREPRULES_CACHE_DIR')]
           def under(path): return any(os.path.commonpath([os.path.realpath(path),r]) == r for r in roots)
@@ -172,11 +205,108 @@ jobs:
           manifests = {}
           for pack in lock['packs']:
               assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,80}',pack['id']) and under(pack['manifestPath'])
+              assert os.path.getsize(pack['manifestPath']) <= 16777216
               target = os.path.join(stage,'provenance','manifests',pack['id']+'.manifest.json')
               shutil.copyfile(pack['manifestPath'],target)
               manifests[pack['id']] = hashlib.sha256(open(target,'rb').read()).hexdigest()
           json.dump({'lock_sha256':hashlib.sha256(open(lockpath,'rb').read()).hexdigest(),'manifests':manifests},open(os.path.join(stage,'provenance','manifest-hashes.json'),'w'))
-          envelope = {'schema':'greprules.scan-envelope.v3','templateVersion':'app-dispatch-v3',
+
+          import tarfile, io, gzip
+          import base64
+          builtin = base64.b64decode("CiMgR2l0IGFkbWluaXN0cmF0aXZlIGZvbGRlciBvciBmaWxlCi5naXQKLnN2bgouaGcKX2RhcmNzCkNWUwoKIyBDb21tb24gbGFyZ2UgcGF0aHMKYnVpbGQvCnZlbmRvci8KZGlzdC8KKi5taW4uanMKLmVudi8KLnRveC8KCiMgcGFja2FnZSBtYW5hZ2Vycwpub2RlX21vZHVsZXMvCi5ucG0vCi55YXJuLwoudmVudi8KX29wYW0vCl9idWlsZC8KX2NhcmdvLwojIG5vdGUgdGhhdCBQSFAgY29tcG9zZXIgdXNlcyB2ZW5kb3IvIGFuZCBDKysgY29uYW4gdXNlcyBidWlsZC8KIyAudmVudiBpcyB1c2VkIGJvdGggYnkgR28gYW5kIFB5dGhvbgoKIyBDb21tb24gdGVzdCBwYXRocwp0ZXN0Lwp0ZXN0cy8KdGVzdHN1aXRlLwoqX3Rlc3QuZ28K").decode()
+          assert hashlib.sha256(builtin.encode()).hexdigest() == "e6acfd569980d21db340e98529dd632bc45d750c1b1f0c9784730e086f298bf5"
+          # The pinned managed ELF extracts its Python frontend in XDG cache,
+          # separately from the Greprules-managed engine binary cache.
+          frontend_template = os.path.join(os.environ['XDG_CACHE_HOME'], 'opengrep', 'v1.32.0', 'semgrep', 'templates', '.semgrepignore')
+          cursor = os.environ['XDG_CACHE_HOME']
+          assert not stat.S_ISLNK(os.lstat(cursor).st_mode)
+          for part in ('opengrep', 'v1.32.0', 'semgrep', 'templates', '.semgrepignore'):
+              cursor = os.path.join(cursor, part)
+              assert not stat.S_ISLNK(os.lstat(cursor).st_mode)
+          assert stat.S_ISREG(os.lstat(frontend_template).st_mode)
+          assert open(frontend_template, 'rb').read(361) == builtin.encode()
+          cli_path = os.path.realpath(shutil.which("greprules"))
+          install = os.path.realpath(os.environ["GREPRULES_INSTALL_DIR"])
+          assert os.path.commonpath([cli_path, install]) == install
+          cli_sha = hashlib.sha256(open(cli_path, "rb").read()).hexdigest()
+          assert lock["engine"]["version"] == "1.32.0" and under(lock["engine"]["path"])
+          engine_sha = hashlib.sha256(open(lock["engine"]["path"], "rb").read()).hexdigest()
+          assert engine_sha == lock["engine"]["sha256"]
+          def safe_name(name):
+              assert isinstance(name, str) and name and not name.startswith("/") and "\\" not in name and "\x00" not in name
+              assert all(part not in ("", ".", "..") for part in name.split("/"))
+              return name
+          definitions = {"schema":"greprules.rule-definitions.v1","registry":"https://api.greprules.io","packs":[]}
+          engine_argv = ["scan"]
+          for pack in lock["packs"]:
+              assert pack["rulePath"].startswith("/") and pack["rulePath"].endswith("/rules") and under(pack["tarballPath"]) and under(pack["rulePath"])
+              archive = open(pack["tarballPath"], "rb").read(16777217)
+              assert len(archive) <= 16777216
+              assert hashlib.sha256(archive).hexdigest() == pack["sha256"]
+              manifest = json.load(open(os.path.join(stage,"provenance","manifests",pack["id"]+".manifest.json")))
+              rules = []
+              contents = os.path.realpath(os.path.dirname(pack["rulePath"]))
+              with gzip.GzipFile(fileobj=io.BytesIO(archive)) as compressed:
+                  expanded_archive = compressed.read(33554433)
+              assert len(expanded_archive) <= 33554432
+              with tarfile.open(fileobj=io.BytesIO(expanded_archive), mode="r:") as tar:
+                  members = {}
+                  expanded = 0
+                  for member in tar:
+                      name = safe_name(member.name.rstrip('/') if member.isdir() else member.name)
+                      assert name not in members and len(members) < 10000
+                      assert member.isfile() or member.isdir()
+                      expanded += member.size
+                      assert expanded <= 33554432 and member.size <= 33554432
+                      members[name] = member
+                  for index, entry in enumerate(manifest["rules"]):
+                      name = safe_name(entry["yaml_path"])
+                      member = members[name]
+                      assert member.isfile() and not member.issym() and not member.islnk() and member.name == name
+                      data = tar.extractfile(member).read()
+                      assert len(data) == member.size and len(data) <= 1048576
+                      candidate = os.path.join(contents, name)
+                      cursor = contents
+                      assert not os.path.islink(os.path.dirname(pack['rulePath']))
+                      for part in name.split('/'):
+                          cursor = os.path.join(cursor, part)
+                          assert not stat.S_ISLNK(os.lstat(cursor).st_mode)
+                      cache = os.path.realpath(candidate)
+                      assert cache == contents or cache.startswith(contents + os.sep)
+                      assert not os.path.islink(cache) and open(cache, "rb").read() == data
+                      rules.append({"entryIndex": index, "opengrepRuleIds": entry["opengrep_rule_ids"], "yamlPath": name, "yamlSha256": hashlib.sha256(data).hexdigest(), "manifestRecord": entry})
+              definitions["packs"].append({"id": pack["id"], "version": str(pack["version"]), "archiveSha256": pack["sha256"], "manifestSha256": pack["manifestSha256"], "rulePath": pack["rulePath"], "rules": rules})
+              engine_argv += ["--config", pack["rulePath"]]
+          # Pinned CLI BuildScanArgs: config flags, format/output flags, then targets.
+          engine_argv += ["--sarif", "--output", os.path.join(stage, "greprules.sarif"), "source"]
+          json.dump(definitions, open(os.path.join(stage,"provenance","rule-definitions.json"), "w"))
+          source_bytes = open(os.path.join(stage,"provenance","source-hashes.json"), "rb").read()
+          source = json.loads(source_bytes)
+          ignore_files = [ {"path": row["path"], "blobSha": row["blobSha"], "sha256": row["sha256"], "size": row["size"]} for row in source["files"] if row["path"] == ".gitignore" or row["path"].endswith("/.gitignore") or row["path"] == ".semgrepignore" or row["path"].endswith("/.semgrepignore") ]
+          root_present = os.path.lexists(os.path.join(os.environ['SCAN_ROOT'], '.semgrepignore'))
+          assert not root_present  # frontend cwd is external root, not nested source/
+          packs = json.loads(os.environ["INPUT_RULE_JSON"])
+          policy_doc = {
+            "schema":"greprules.full-policy.v1","identityVersion":1,
+            "command":"greprules scan source --root . --sarif --output greprules.sarif --verbose",
+            "argv":["greprules","scan","source","--root",".","--sarif","--output","greprules.sarif","--verbose"],
+            "engineArgv": engine_argv,
+            "cli":{"version":"0.5.1","sha256":cli_sha},
+            "engine":{"name":"Opengrep OSS","version":"1.32.0","sha256":engine_sha},
+            "includeDefaultRules": False,
+            "selection":{"mode": os.environ["INPUT_RULE_MODE"], "packs": packs},
+            "config":{"schemaVersion":"greprules.local.v1","sha256": os.environ["INPUT_POLICY"], "registry":"https://api.greprules.io"},
+            "targetMode":"git-tracked-regular-files-v1",
+            "sourceManifestDigest": hashlib.sha256(source_bytes).hexdigest(),
+            "sourceBytesUnchanged": True,
+            "compatibilityDigest": os.environ["INPUT_SCOPE_POLICY"],
+            "builtinIgnore":{"sha256": hashlib.sha256(builtin.encode()).hexdigest(), "source":"opengrep/opengrep@v1.32.0 cli/src/semgrep/templates/.semgrepignore", "byteLength":360, "rootSemgrepignorePresent": root_present, "applies": not root_present},
+            "ignoreFiles": ignore_files,
+            "limits":{"maxTargetBytes":1000000,"timeoutSeconds":5,"dynamicTimeout":False,"dynamicTimeoutMaxMultiplier":20,"dynamicTimeoutUnitKb":30,"allowRuleTimeoutControl":False,"timeoutThreshold":3,"excludeMinifiedFiles":False,"respectGitignore":True,"respectSemgrepignore":True,"cliExcludePatterns":[]},
+            "gitIsolation":{"hooksPath":"/dev/null","excludesFile":"/dev/null","attributesFile":"/dev/null","configNosystem":True,"configGlobal":"/dev/null","configSystem":"/dev/null"}
+          }
+          json.dump(policy_doc, open(os.path.join(stage,"provenance","coverage-policy.json"), "w"))
+          envelope = {'schema':'greprules.scan-envelope.v4','templateVersion':'app-dispatch-v4',
             'repository':{'id':int(os.environ['EXECUTION_REPOSITORY_ID']),'fullName':os.environ['EXECUTION_REPOSITORY']},
             'installationId':int(os.environ['INPUT_INSTALLATION']),'intentId':os.environ['INPUT_INTENT'],'configurationRevision':int(os.environ['INPUT_REVISION']),
             'correlation':os.environ['INPUT_CORRELATION'],'context':os.environ['INPUT_CONTEXT'],
@@ -187,14 +317,16 @@ jobs:
               envelope['pull'] = {'id':int(os.environ['INPUT_PULL_ID']),'number':int(os.environ['INPUT_PULL_NUMBER']),
                 'base':{'repositoryId':int(os.environ['EXECUTION_REPOSITORY_ID']),'fullName':os.environ['EXECUTION_REPOSITORY'],'ref':os.environ['INPUT_BASE_REF'],'sha':os.environ['INPUT_BASE_SHA']},
                 'head':{'repositoryId':int(os.environ['INPUT_REPOSITORY']),'fullName':os.environ['INPUT_HEAD_REPOSITORY_NAME'],'ref':os.environ['INPUT_HEAD_REF'],'sha':os.environ['INPUT_SHA']}}
+          envelope['managed'] = {'branch': os.environ['INPUT_MANAGED_BRANCH'], 'generation': int(os.environ['INPUT_MANAGED_GENERATION']) if os.environ['INPUT_CONTEXT']=='managed' else None, 'intentOrder': int(os.environ['INPUT_MANAGED_ORDER']) if os.environ['INPUT_CONTEXT']=='managed' else None}
+          envelope['rulePolicy'] = {'mode': os.environ['INPUT_RULE_MODE'], 'packs': json.loads(os.environ['INPUT_RULE_JSON']), 'scopePolicyDigest': os.environ['INPUT_SCOPE_POLICY']}
           json.dump(envelope,open(os.path.join(stage,'envelope.json'),'w'))
           PY
       - name: Upload immutable scan evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: greprules-app-v3-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/greprules-app-v3-artifact
+          name: greprules-app-v4-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/greprules-app-v4-artifact
           retention-days: 30
           if-no-files-found: error
           overwrite: false
